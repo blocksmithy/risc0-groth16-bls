@@ -1,0 +1,21 @@
+# Build artifacts
+/bin/
+**/target/
+/go/groth16bls
+/go/groth16bls-gpu
+/go/ceremony
+
+# Generated ceremony / key material (never commit keys)
+*.pk.bin
+pk.bin
+p1_*.bin
+p2_*.bin
+commons.bin
+
+# OS / editor
+.DS_Store
+*.swp
+
+# Python bytecode (constant-generation scripts)
+__pycache__/
+*.pyc

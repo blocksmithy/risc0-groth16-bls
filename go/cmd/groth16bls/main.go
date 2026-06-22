@@ -1,0 +1,356 @@
+// Command groth16bls is the BLS12-381 Groth16 prover for RISC0 identity_bls seals - the gnark
+// analogue of rapidsnark in RISC0's BN254 stark2snark path. RISC0's host invokes it as a subprocess
+// (ReceiptKind::Groth16Bls): it takes a seal, proves the VerifyReceipt circuit, and writes the proof
+// + the 5 public inputs (risc0 schema). It is NOT a standalone product - it is the proving backend.
+//
+// Subcommands:
+//
+//	setup --dev          compile + INSECURE dev Setup -> write ccs/pk/vk to the keys dir (+DEV marker)
+//	prove --seal s.bin   load keys, prove the seal, write proof.bin + public.bin
+//	circuit-id [--check] print the frozen-circuit fingerprint (sha256 of the R1CS the ceremony keys);
+//	                     --check <pin.json> fails on drift.
+//
+// Keys directory (the "component dir"): --keys flag > $RISC0_GROTH16_BLS_HOME > ~/.risc0/groth16-bls.
+// Holds ccs.bin, pk.bin, vk.bin (+ an INSECURE_DEV marker for dev keys).
+//
+// Dev-mode gating (per the integration contract): a real `prove` (no --dev) fails CLOSED before the
+// costly proof - it proves only if the SHA-256 of the canonical Cardano-v2 encoding of the keys'
+// vk.bin equals the pinned ceremony value in $RISC0_GROTH16_BLS_VK_SHA256. It fingerprints the
+// actual proving VK (not a standalone, desyncable vk.cardano.bin file, and not the absence of a
+// marker), and the post-prove self-verify ties pk.bin to that VK - so toxic-waste dev keys cannot
+// be used for a production proof.
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/consensys/gnark-crypto/ecc"
+	"github.com/consensys/gnark/backend/groth16"
+	groth16bls "github.com/consensys/gnark/backend/groth16/bls12-381"
+	"github.com/consensys/gnark/backend/witness"
+	"github.com/consensys/gnark/frontend"
+	"github.com/consensys/gnark/frontend/cs/r1cs"
+	"github.com/consensys/gnark/logger"
+	"github.com/rs/zerolog"
+
+	"github.com/pitcon/stark-to-snark-bls/go/serialize"
+	"github.com/pitcon/stark-to-snark-bls/go/stark"
+)
+
+const (
+	nQueries  = 50 // full verification (all FRI queries)
+	nPublic   = 5  // risc0 5-input schema (control_root_lo/hi, claim_digest_lo/hi, control_id)
+	devMarker = "INSECURE_DEV"
+	ccsFile   = "ccs.bin"
+	pkFile    = "pk.bin"
+	vkFile    = "vk.bin"
+	// ceremonyVKEnv pins the SHA-256 (hex) of the canonical Cardano-v2 encoding of the trusted
+	// ceremony verifying key. A non-dev prove fails closed unless the keys' vk.bin canonicalizes to
+	// this value.
+	ceremonyVKEnv = "RISC0_GROTH16_BLS_VK_SHA256"
+)
+
+func main() {
+	// Silent by default (keeps stdout machine-clean). GROTH16BLS_VERBOSE=1 enables gnark's logger,
+	// which surfaces the ICICLE GPU backend's device warm-up ("ICICLE … CUDA device") - the visible
+	// evidence that the prove ran on the GPU rather than the CPU fallback.
+	if os.Getenv("GROTH16BLS_VERBOSE") == "1" {
+		logger.Set(zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr}).With().Timestamp().Logger())
+	} else {
+		logger.Set(zerolog.Nop())
+	}
+	if len(os.Args) < 2 {
+		usage()
+	}
+	switch os.Args[1] {
+	case "setup":
+		cmdSetup(os.Args[2:])
+	case "prove":
+		cmdProve(os.Args[2:])
+	case "verify":
+		cmdVerify(os.Args[2:])
+	case "circuit-id":
+		cmdCircuitID(os.Args[2:])
+	case "emit-ccs":
+		cmdEmitCCS(os.Args[2:])
+	default:
+		usage()
+	}
+}
+
+func usage() {
+	fmt.Fprintln(os.Stderr, "usage: groth16bls <setup|prove|verify|circuit-id|emit-ccs> [flags]")
+	os.Exit(2)
+}
+
+func die(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, "groth16bls: "+format+"\n", a...)
+	os.Exit(1)
+}
+
+// keysDir resolves the component dir: --keys flag > $RISC0_GROTH16_BLS_HOME > ~/.risc0/groth16-bls.
+func keysDir(flagVal string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	if e := os.Getenv("RISC0_GROTH16_BLS_HOME"); e != "" {
+		return e
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		die("cannot resolve home dir for default keys location: %v", err)
+	}
+	return filepath.Join(home, ".risc0", "groth16-bls")
+}
+
+func cmdSetup(args []string) {
+	fs := flag.NewFlagSet("setup", flag.ExitOnError)
+	keys := fs.String("keys", "", "keys/component dir (default: $RISC0_GROTH16_BLS_HOME or ~/.risc0/groth16-bls)")
+	dev := fs.Bool("dev", false, "INSECURE dev setup (toxic waste in-memory) - for risc0 dev mode only")
+	_ = fs.Parse(args)
+	dir := keysDir(*keys)
+	if !*dev {
+		die("non-dev setup is unsupported: production keys come from the Phase-2 MPC ceremony and must "+
+			"be placed in %s (ccs.bin/pk.bin/vk.bin). Use --dev for an insecure dev setup.", dir)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		die("mkdir keys dir: %v", err)
+	}
+
+	t := time.Now()
+	ccs, err := frontend.Compile(ecc.BLS12_381.ScalarField(), r1cs.NewBuilder, stark.ReceiptTemplate(nQueries))
+	if err != nil {
+		die("compile: %v", err)
+	}
+	fmt.Fprintf(os.Stderr, "compiled %d constraints in %s\n", ccs.GetNbConstraints(), time.Since(t).Round(time.Second))
+
+	t = time.Now()
+	pk, vk, err := groth16.Setup(ccs)
+	if err != nil {
+		die("setup: %v", err)
+	}
+	fmt.Fprintf(os.Stderr, "INSECURE dev setup done in %s (toxic waste is known - NOT for production)\n", time.Since(t).Round(time.Second))
+
+	writeTo(filepath.Join(dir, ccsFile), ccs)
+	writeTo(filepath.Join(dir, pkFile), pk)
+	writeTo(filepath.Join(dir, vkFile), vk)
+	if _, err := serialize.WriteCardanoVK(filepath.Join(dir, "vk.cardano.bin"), vk.(*groth16bls.VerifyingKey)); err != nil {
+		die("write vk.cardano.bin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, devMarker), []byte("insecure dev keys; do not use for production proofs\n"), 0o644); err != nil {
+		die("write dev marker: %v", err)
+	}
+	fmt.Printf("wrote dev keys to %s (ccs/pk/vk + vk.cardano.bin + %s)\n", dir, devMarker)
+}
+
+func cmdProve(args []string) {
+	fs := flag.NewFlagSet("prove", flag.ExitOnError)
+	keys := fs.String("keys", "", "keys/component dir")
+	seal := fs.String("seal", "", "path to the identity_bls seal.bin")
+	out := fs.String("out", ".", "output dir for proof.bin + public.bin")
+	dev := fs.Bool("dev", false, "allow INSECURE dev keys (risc0 dev mode)")
+	_ = fs.Parse(args)
+	if *seal == "" {
+		die("--seal is required")
+	}
+	dir := keysDir(*keys)
+
+	// Gating BEFORE the costly load/prove.
+	if !haveKeys(dir) {
+		if *dev {
+			die("no keys at %s - run: groth16bls setup --dev --keys %s", dir, dir)
+		}
+		die("no Groth16 keys at %s - production proving needs ceremony keys (run the ceremony, or use --dev)", dir)
+	}
+	// Load the verifying key first: it is the key the proof is bound to (self-verify below + the
+	// receipt's verifier_parameters), so it - NOT a standalone, desyncable vk.cardano.bin file - is
+	// what the production gate must fingerprint.
+	vk := groth16.NewVerifyingKey(ecc.BLS12_381)
+	readFrom(filepath.Join(dir, vkFile), vk)
+	if !*dev {
+		// FAIL CLOSED: a production prove must AFFIRMATIVELY match a pinned ceremony VK fingerprint -
+		// the SHA-256 of the canonical (Cardano-v2) encoding of THIS vk.bin. We never trust the
+		// absence of a marker, nor a standalone vk.cardano.bin (an attacker can swap pk.bin/vk.bin
+		// while leaving a ceremony vk.cardano.bin in place). The self-verify below ties pk.bin to
+		// this vk, so fingerprinting vk pins the whole proving key to the ceremony.
+		want := strings.ToLower(strings.TrimSpace(os.Getenv(ceremonyVKEnv)))
+		if want == "" {
+			die("production proving requires the ceremony VK fingerprint in $%s (none configured) - "+
+				"the Phase-2 ceremony has not been pinned yet; use --dev for risc0 dev mode", ceremonyVKEnv)
+		}
+		got := sha256Hex(cardanoVKBytes(vk))
+		if got != want {
+			die("keys at %s do NOT match the ceremony VK pinned in $%s\n  want %s\n  got  %s\n"+
+				"refusing to prove with an untrusted (possibly INSECURE dev) key", dir, ceremonyVKEnv, want, got)
+		}
+	}
+
+	ccs := groth16.NewCS(ecc.BLS12_381)
+	readFrom(filepath.Join(dir, ccsFile), ccs)
+	pk := newProvingKey() // CPU or ICICLE pk type, per build tag
+	readFrom(filepath.Join(dir, pkFile), pk)
+
+	sealWords := readSeal(*seal)
+	assignment, err := stark.AssignReceipt(sealWords, nQueries)
+	if err != nil {
+		die("assign witness from seal: %v", err)
+	}
+	fullWit, err := frontend.NewWitness(assignment, ecc.BLS12_381.ScalarField())
+	if err != nil {
+		die("witness: %v", err)
+	}
+	pubWit, err := fullWit.Public()
+	if err != nil {
+		die("public witness: %v", err)
+	}
+
+	t := time.Now()
+	proof, err := proveBackend(ccs, pk, fullWit) // CPU, or GPU under -tags icicle
+	if err != nil {
+		die("prove: %v", err)
+	}
+	fmt.Fprintf(os.Stderr, "proved (%s) in %s\n", proverBackend, time.Since(t).Round(time.Millisecond))
+
+	if err := groth16.Verify(proof, vk, pubWit); err != nil {
+		die("self-verify failed (this should never happen): %v", err)
+	}
+
+	if err := os.MkdirAll(*out, 0o755); err != nil {
+		die("mkdir out: %v", err)
+	}
+	// gnark-native (canonical, round-trippable) ...
+	writeTo(filepath.Join(*out, "proof.bin"), proof)
+	writeTo(filepath.Join(*out, "public.bin"), pubWit)
+	// ... plus Cardano-minimal v2 (commitment-aware on-chain format).
+	if _, err := serialize.WriteCardanoProof(filepath.Join(*out, "proof.cardano.bin"), proof.(*groth16bls.Proof)); err != nil {
+		die("write proof.cardano.bin: %v", err)
+	}
+	if _, err := serialize.WriteCardanoPublic(filepath.Join(*out, "public.cardano.bin"), pubWit, nPublic, serialize.NLimbsPerScalarNative); err != nil {
+		die("write public.cardano.bin: %v", err)
+	}
+	// vk.cardano.bin too, so the out dir is self-contained for the on-chain verifier.
+	if _, err := serialize.WriteCardanoVK(filepath.Join(*out, "vk.cardano.bin"), vk.(*groth16bls.VerifyingKey)); err != nil {
+		die("write vk.cardano.bin: %v", err)
+	}
+	fmt.Printf("wrote proof.bin/public.bin (gnark) + proof/public/vk.cardano.bin (v2) to %s "+
+		"(5 public inputs, risc0 schema, nC=1)\n", *out)
+}
+
+// cmdVerify checks a gnark-native proof.bin against vk.bin + public.bin. RISC0's Groth16Bls
+// verify_integrity shells out to this (same Go-binary contract as prove), so we never duplicate
+// the gnark verifier in Rust. The authoritative on-chain check is the Aiken/Cardano verifier.
+func cmdVerify(args []string) {
+	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	keys := fs.String("keys", "", "keys/component dir (for vk.bin, if --vk not given)")
+	vkPath := fs.String("vk", "", "path to vk.bin (default: <keys>/vk.bin)")
+	proofPath := fs.String("proof", "", "path to proof.bin (gnark-native)")
+	pubPath := fs.String("public", "", "path to public.bin (gnark-native)")
+	_ = fs.Parse(args)
+	if *proofPath == "" || *pubPath == "" {
+		die("--proof and --public are required")
+	}
+	vkp := *vkPath
+	if vkp == "" {
+		vkp = filepath.Join(keysDir(*keys), vkFile)
+	}
+
+	vk := groth16.NewVerifyingKey(ecc.BLS12_381)
+	readFrom(vkp, vk)
+	proof := groth16.NewProof(ecc.BLS12_381)
+	readFrom(*proofPath, proof)
+	pubWit, err := witness.New(ecc.BLS12_381.ScalarField())
+	if err != nil {
+		die("new witness: %v", err)
+	}
+	readFrom(*pubPath, pubWit)
+
+	if err := groth16.Verify(proof, vk, pubWit); err != nil {
+		die("VERIFY FAILED: %v", err)
+	}
+	fmt.Println("OK: proof verifies against vk + public (5 inputs, risc0 schema)")
+}
+
+// ---- key-dir helpers ----
+
+func haveKeys(dir string) bool {
+	for _, f := range []string{ccsFile, pkFile, vkFile} {
+		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// sha256Hex returns the lowercase hex SHA-256 of bytes.
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// cardanoVKBytes returns the canonical Cardano-v2 encoding of a verifying key - the form the
+// production fingerprint and the receipt's verifier_parameters are both taken over.
+func cardanoVKBytes(vk groth16.VerifyingKey) []byte {
+	var buf bytes.Buffer
+	if err := serialize.EncodeCardanoVK(&buf, vk.(*groth16bls.VerifyingKey)); err != nil {
+		die("encode vk for fingerprint: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// ---- gnark (de)serialization (canonical WriteTo/ReadFrom) ----
+
+func writeTo(path string, v io.WriterTo) {
+	f, err := os.Create(path)
+	if err != nil {
+		die("create %s: %v", path, err)
+	}
+	if _, err := v.WriteTo(f); err != nil {
+		_ = f.Close()
+		die("write %s: %v", path, err)
+	}
+	// fsync + a checked Close so a crash or a deferred write-back error can't leave a silently
+	// truncated key/proof file that later "looks" present.
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		die("sync %s: %v", path, err)
+	}
+	if err := f.Close(); err != nil {
+		die("close %s: %v", path, err)
+	}
+}
+
+func readFrom(path string, v io.ReaderFrom) {
+	f, err := os.Open(path)
+	if err != nil {
+		die("open %s: %v", path, err)
+	}
+	defer f.Close()
+	if _, err := v.ReadFrom(f); err != nil {
+		die("read %s: %v", path, err)
+	}
+}
+
+func readSeal(path string) []uint32 {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		die("read seal %s: %v", path, err)
+	}
+	if len(b)%4 != 0 {
+		die("seal length %d not a multiple of 4", len(b))
+	}
+	w := make([]uint32, len(b)/4)
+	for i := range w {
+		w[i] = binary.LittleEndian.Uint32(b[4*i:])
+	}
+	return w
+}

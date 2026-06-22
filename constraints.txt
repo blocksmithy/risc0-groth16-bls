@@ -1,0 +1,22 @@
+# R1CS constraint counts (BLS12-381). Regenerate: make constraints-report.
+# Full verifier stark.VerifyReceipt (validity + FRI + 5-input claim binding, 50 queries) = 4,577,317 R1CS
+# (~20s compile; run `COMPILE_RECEIPT=1 go run ./cmd/constraints` to re-measure).
+# gadget                                   r1cs
+poseidon_bls.Permute (1 perm)                 246
+poseidon_bls.HashPair                         241
+poseidon_bls.HashElemSlice (16 elems)         241
+poseidon_bls.Sponge.Mix+RandomElem           1291
+babybear.E4Mul (1 Fp4 mul)                    232
+babybear.E4Inv (1 Fp4 inverse)                237
+babybear.AssertCanonical                       64
+babybear.IngestElem (canonical + native↔emul bind)       93
+stark.MerkleVerify (2^20 tree, 15-fold)      3923
+stark.MerkleRoot (top_size 32)               7441
+stark.PolyEval (Fp4, 3 coeffs)                456
+stark.FoldRound (FRI fold, 1 round)          6198
+stark.VerifyFRIQuery (full per-query FRI)    18101
+stark.EvalU (DEEP-ALI, 643 taps)           338259
+stark.ComputeCheck (DEEP-ALI check poly)     4022
+stark.ComboU+FriEvalTaps (DEEP query, goal0)    67794
+stark.PolyExt (DEEP-ALI validity, 12.4k steps)   300510
+stark.VerifyValidity (driver: transcript+ingest+V1)  1190944

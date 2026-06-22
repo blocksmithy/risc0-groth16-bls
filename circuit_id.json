@@ -1,0 +1,10 @@
+{
+  "curve": "BLS12-381",
+  "n_queries": 50,
+  "nb_constraints": 4577317,
+  "nb_public_variables": 6,
+  "nb_secret_variables": 25749,
+  "nb_internal_variables": 5168245,
+  "ccs_serialized_bytes": 450479830,
+  "ccs_sha256": "47d996276e852b5183d6c2766bce081b488062def2791669ab95eb789d467dd2"
+}
