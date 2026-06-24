@@ -113,6 +113,7 @@ The current key is from a small (10-participant) ceremony; a larger one is plann
 
 | Document | Purpose |
 |---|---|
+| [END_TO_END.md](END_TO_END.md) | Prove and verify a RISC Zero guest end to end - the hello-world walkthrough. |
 | [go/STARK_VERIFY_SPEC.md](go/STARK_VERIFY_SPEC.md) | The RISC0 STARK verifier specification the circuit implements. |
 | [PUBLIC_INPUTS.md](PUBLIC_INPUTS.md) | Public-input layout. |
 
