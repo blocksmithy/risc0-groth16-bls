@@ -1,0 +1,22 @@
+{
+  "active": "small-ceremony-2026-06",
+  "keysets": {
+    "small-ceremony-2026-06": {
+      "description": "10-participant Phase-2 MPC ceremony for the risc0-groth16-bls circuit; finalized 2026-06-23, sealed with a Cardano mainnet block-hash beacon.",
+      "vk_gate_sha256": "7db98ea2d19b86853dee0a076141f51fadabf1ace22b2e6c86822947101355a5",
+      "vk_fingerprint_sha256": "802691bf30ae9428e489ae1f110fcf364225dd0933c2b19f07d1ab4ae2a85ff2",
+      "ccs_sha256": "47d996276e852b5183d6c2766bce081b488062def2791669ab95eb789d467dd2",
+      "pk_sha256": "c1776c1efb7ad42a04ce06b83d989507ab9dcf986bbbce6d9cd878ba6f3b5a4e",
+      "pk_url": "https://github.com/blocksmithy/risc0-groth16-bls/releases/download/keys-small-ceremony-2026-06/pk.bin",
+      "ccs_url": "https://github.com/blocksmithy/risc0-groth16-bls/releases/download/keys-small-ceremony-2026-06/ccs.bin",
+      "ceremony": {
+        "participants": 10,
+        "contributions": "2026-06-20..2026-06-23",
+        "finalized": "2026-06-23",
+        "beacon": "a0fdbbe04b64d38629c4ab991d6ca0c7b5800e00265fc1c048ea8ed11bc89e01",
+        "beacon_source": "Cardano mainnet block hash",
+        "release": "https://github.com/blocksmithy/risc0-groth16-bls/releases/tag/keys-small-ceremony-2026-06"
+      }
+    }
+  }
+}

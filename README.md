@@ -4,6 +4,10 @@ A gnark (Go) circuit that verifies a RISC Zero succinct STARK receipt inside a G
 **BLS12-381**, so a RISC Zero proof can be settled on-chain on Cardano (native BLS12-381 builtins) with
 a single small pairing check, without touching BN254.
 
+> **Not audited.** This is a faithful in-circuit reimplementation of RISC Zero's STARK verifier
+> (`risc0_zkp::verify`), pinned to and differentially checked against the upstream source - but it has
+> **not** had a formal security audit. Review and use accordingly.
+
 ## Why BLS12-381
 
 RISC Zero's stock `stark2snark` path wraps proofs into a BN254 Groth16 proof. Cardano's on-chain
@@ -47,6 +51,7 @@ extension are used for the FRI/DEEP arithmetic only.
 | `go/hash/poseidon_bls/` | In-circuit Poseidon over BLS12-381 Fr (`poseidonperm_x5_255_3`), matching the RISC Zero `poseidon_bls` suite. |
 | `go/field/babybear/` | Emulated BabyBear and its degree-4 extension, used for FRI/DEEP arithmetic. |
 | `go/cmd/groth16bls/` | The gnark prover backend (`setup`, `prove`, `verify`, `emit-ccs`, `circuit-id`). |
+| `go/keys/` | Committed verifying keys + the key manifest; proving keys are fetched from the release. |
 | `go/serialize/` | Cardano wire-format serialization of proof / public input / verifying key. |
 | `rust/groth16-bls-verify/` | Standalone `no_std` native BLS12-381 Groth16 verifier for the Cardano-format proof. |
 | `prototype/poseidon_bls/` | Provenance for the Poseidon constants: generator scripts and reference vectors. |
@@ -59,6 +64,29 @@ extension are used for the FRI/DEEP arithmetic only.
   on-chain.
 - **Native (Rust):** `rust/groth16-bls-verify` verifies the resulting Groth16 proof in the Cardano wire
   format - the same check a Plutus script performs, runnable off-chain.
+
+## Keys
+
+The verifying key is committed (`go/keys/<key-set>/vk.bin`, 976 bytes), so **verification needs nothing
+extra** - the on-chain (Plutus/Aiken) script and the native Rust verifier already have everything.
+
+For **proving**, `groth16bls` ships with a key manifest and fetches the large proving key on first use:
+
+```sh
+groth16bls prove --seal seal.bin --out .
+```
+
+No flags, no env var, no dev key: it resolves the active key-set from `go/keys/manifest.json`, uses the
+embedded vk, and downloads the proving key + constraint system from the ceremony release (each
+SHA-256-verified against the manifest, then cached in `~/.risc0/groth16-bls/`). `--key NAME` selects a
+different key-set; `--keys DIR` uses a custom keys directory.
+
+The active key is **`small-ceremony-2026-06`** - a 10-participant Phase-2 MPC ceremony sealed with a
+Cardano mainnet block-hash beacon. The proving key, all 10 contribution blobs, the transcript, and a
+one-command re-verify procedure are published as a
+[release](https://github.com/blocksmithy/risc0-groth16-bls/releases/tag/keys-small-ceremony-2026-06),
+so anyone can reproduce the verifying key independently. (A larger ceremony is planned; switching keys
+is a one-line manifest change.)
 
 ## Build and test
 
@@ -77,8 +105,9 @@ memory, every hint output constrained, mandatory single-mutation negative tests,
 fidelity to the pinned RISC Zero verifier. The receipt is fully adversarial input; the circuit is the
 security boundary.
 
-The Groth16 verifying key requires a Phase-2 MPC ceremony before any production use; the prover backend
-fails closed when asked to prove with a non-ceremony key.
+The Groth16 keys come from a Phase-2 MPC ceremony (see Keys); `prove` fails closed unless the loaded
+key matches the pinned ceremony fingerprint, so it cannot silently fall back to an insecure dev key.
+The current key is from a small (10-participant) ceremony; a larger one is planned.
 
 ## Documents
 

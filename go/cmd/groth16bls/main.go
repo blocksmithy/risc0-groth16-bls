@@ -43,6 +43,7 @@ import (
 	"github.com/consensys/gnark/logger"
 	"github.com/rs/zerolog"
 
+	"github.com/pitcon/stark-to-snark-bls/go/keys"
 	"github.com/pitcon/stark-to-snark-bls/go/serialize"
 	"github.com/pitcon/stark-to-snark-bls/go/stark"
 )
@@ -155,7 +156,8 @@ func cmdSetup(args []string) {
 
 func cmdProve(args []string) {
 	fs := flag.NewFlagSet("prove", flag.ExitOnError)
-	keys := fs.String("keys", "", "keys/component dir")
+	keysDirFlag := fs.String("keys", "", "explicit keys dir (advanced; overrides the built-in manifest)")
+	keySet := fs.String("key", "", "manifest key-set to use (default: the active one)")
 	seal := fs.String("seal", "", "path to the identity_bls seal.bin")
 	out := fs.String("out", ".", "output dir for proof.bin + public.bin")
 	dev := fs.Bool("dev", false, "allow INSECURE dev keys (risc0 dev mode)")
@@ -163,42 +165,86 @@ func cmdProve(args []string) {
 	if *seal == "" {
 		die("--seal is required")
 	}
-	dir := keysDir(*keys)
 
-	// Gating BEFORE the costly load/prove.
-	if !haveKeys(dir) {
-		if *dev {
-			die("no keys at %s - run: groth16bls setup --dev --keys %s", dir, dir)
-		}
-		die("no Groth16 keys at %s - production proving needs ceremony keys (run the ceremony, or use --dev)", dir)
-	}
-	// Load the verifying key first: it is the key the proof is bound to (self-verify below + the
-	// receipt's verifier_parameters), so it - NOT a standalone, desyncable vk.cardano.bin file - is
-	// what the production gate must fingerprint.
+	// Resolve the verifying key (loaded) plus the constraint-system and proving-key paths.
+	// Three modes:
+	//   default      committed vk + pk/ccs fetched from the manifest's active key-set
+	//                (SHA-256-verified, cached). No flags, no env var, no dev key.
+	//   --key NAME   same, selecting a different key-set from the manifest.
+	//   --keys DIR   an explicit keys dir (advanced/custom keys); --dev allows insecure dev keys.
 	vk := groth16.NewVerifyingKey(ecc.BLS12_381)
-	readFrom(filepath.Join(dir, vkFile), vk)
-	if !*dev {
-		// FAIL CLOSED: a production prove must AFFIRMATIVELY match a pinned ceremony VK fingerprint -
-		// the SHA-256 of the canonical (Cardano-v2) encoding of THIS vk.bin. We never trust the
-		// absence of a marker, nor a standalone vk.cardano.bin (an attacker can swap pk.bin/vk.bin
-		// while leaving a ceremony vk.cardano.bin in place). The self-verify below ties pk.bin to
-		// this vk, so fingerprinting vk pins the whole proving key to the ceremony.
+	var ccsPath, pkPath string
+
+	if *keysDirFlag != "" || *dev {
+		dir := keysDir(*keysDirFlag)
+		if !haveKeys(dir) {
+			if *dev {
+				die("no keys at %s - run: groth16bls setup --dev --keys %s", dir, dir)
+			}
+			die("no Groth16 keys at %s - omit --keys to use the built-in manifest, run a ceremony, or use --dev", dir)
+		}
+		readFrom(filepath.Join(dir, vkFile), vk)
+		if !*dev {
+			// FAIL CLOSED against an explicit dir: it must match the ceremony VK pinned in $ENV
+			// (the canonical Cardano-v2 encoding of THIS vk.bin).
+			want := strings.ToLower(strings.TrimSpace(os.Getenv(ceremonyVKEnv)))
+			if want == "" {
+				die("production proving from --keys requires the ceremony VK fingerprint in $%s "+
+					"(or omit --keys to use the built-in manifest)", ceremonyVKEnv)
+			}
+			if got := sha256Hex(cardanoVKBytes(vk)); got != want {
+				die("keys at %s do NOT match the ceremony VK pinned in $%s\n  want %s\n  got  %s\n"+
+					"refusing to prove with an untrusted (possibly INSECURE dev) key", dir, ceremonyVKEnv, want, got)
+			}
+		}
+		ccsPath = filepath.Join(dir, ccsFile)
+		pkPath = filepath.Join(dir, pkFile)
+	} else {
+		man, err := keys.Load()
+		if err != nil {
+			die("%v", err)
+		}
+		ks, err := man.Resolve(*keySet)
+		if err != nil {
+			die("%v", err)
+		}
+		fmt.Fprintf(os.Stderr, "key-set %q (%d-participant ceremony, finalized %s)\n",
+			ks.Name, ks.Ceremony.Participants, ks.Ceremony.Finalized)
+		// The verifying key is committed (embedded). Its Cardano encoding must match the manifest's
+		// pinned gate value ($ENV overrides) - this binds the binary to the published key.
+		vkBytes, err := ks.VKBytes()
+		if err != nil {
+			die("read embedded vk: %v", err)
+		}
+		if _, err := vk.ReadFrom(bytes.NewReader(vkBytes)); err != nil {
+			die("parse embedded vk: %v", err)
+		}
 		want := strings.ToLower(strings.TrimSpace(os.Getenv(ceremonyVKEnv)))
 		if want == "" {
-			die("production proving requires the ceremony VK fingerprint in $%s (none configured) - "+
-				"the Phase-2 ceremony has not been pinned yet; use --dev for risc0 dev mode", ceremonyVKEnv)
+			want = ks.VKGateSHA256
 		}
-		got := sha256Hex(cardanoVKBytes(vk))
-		if got != want {
-			die("keys at %s do NOT match the ceremony VK pinned in $%s\n  want %s\n  got  %s\n"+
-				"refusing to prove with an untrusted (possibly INSECURE dev) key", dir, ceremonyVKEnv, want, got)
+		if got := sha256Hex(cardanoVKBytes(vk)); got != want {
+			die("embedded vk for key-set %q does NOT match the pinned gate value\n  want %s\n  got  %s",
+				ks.Name, want, got)
+		}
+		// The proving key + constraint system are fetched on first use, SHA-256-verified, cached.
+		cache, err := ks.CacheDir("")
+		if err != nil {
+			die("%v", err)
+		}
+		logf := func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) }
+		if ccsPath, err = ks.EnsureCCS(cache, logf); err != nil {
+			die("%v", err)
+		}
+		if pkPath, err = ks.EnsurePK(cache, logf); err != nil {
+			die("%v", err)
 		}
 	}
 
 	ccs := groth16.NewCS(ecc.BLS12_381)
-	readFrom(filepath.Join(dir, ccsFile), ccs)
+	readFrom(ccsPath, ccs)
 	pk := newProvingKey() // CPU or ICICLE pk type, per build tag
-	readFrom(filepath.Join(dir, pkFile), pk)
+	readFrom(pkPath, pk)
 
 	sealWords := readSeal(*seal)
 	assignment, err := stark.AssignReceipt(sealWords, nQueries)
