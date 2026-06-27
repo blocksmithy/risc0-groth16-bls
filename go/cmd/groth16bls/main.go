@@ -22,6 +22,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
@@ -84,13 +85,15 @@ func main() {
 		cmdCircuitID(os.Args[2:])
 	case "emit-ccs":
 		cmdEmitCCS(os.Args[2:])
+	case "dump":
+		cmdDump(os.Args[2:])
 	default:
 		usage()
 	}
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: groth16bls <setup|prove|verify|circuit-id|emit-ccs> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: groth16bls <setup|prove|verify|circuit-id|emit-ccs|dump> [flags]")
 	os.Exit(2)
 }
 
@@ -242,9 +245,11 @@ func cmdProve(args []string) {
 	}
 
 	ccs := groth16.NewCS(ecc.BLS12_381)
+	tCcs := time.Now()
 	readFrom(ccsPath, ccs)
+	fmt.Fprintf(os.Stderr, "ccs loaded in %s\n", time.Since(tCcs).Round(time.Millisecond))
 	pk := newProvingKey() // CPU or ICICLE pk type, per build tag
-	readFrom(pkPath, pk)
+	loadProvingKey(pk, pkPath)
 
 	sealWords := readSeal(*seal)
 	assignment, err := stark.AssignReceipt(sealWords, nQueries)
@@ -383,6 +388,175 @@ func readFrom(path string, v io.ReaderFrom) {
 	defer f.Close()
 	if _, err := v.ReadFrom(f); err != nil {
 		die("read %s: %v", path, err)
+	}
+}
+
+// ---- fast proving-key load (gnark raw dump; no point decompression) ----
+//
+// ReadFrom/WriteTo are the canonical COMPRESSED format: each curve point is decompressed on
+// load (a sqrt per point), which for a multi-million-constraint key is minutes of CPU. gnark's
+// WriteDump/ReadDump are a RAW memory dump — no decompression — loading in seconds. The ICICLE
+// proving key inherits both from its embedded gnark base key (provingkey.go embeds
+// groth16_bls12381.ProvingKey), so this works for both the CPU and the -tags icicle build.
+
+type dumpReadable interface{ ReadDump(io.Reader) error }
+type dumpWritable interface{ WriteDump(io.Writer) error }
+
+// loadProvingKey loads pk from a raw `<pkPath>.dump` (WriteDump format) when present, else the
+// compressed pkPath via ReadFrom. Generate the dump once with `groth16bls dump` so prove never
+// pays the decompression cost.
+//
+// The dump is gnark-version- and arch-specific and skips subgroup checks (raw, trusted load). It is
+// auto-used whenever `<pkPath>.dump` exists, so regenerate it whenever the binary's gnark version
+// changes and never carry a stale dump across an upgrade. A wrong dump is not silently mis-proven:
+// the post-prove self-verify in cmdProve fails closed.
+func loadProvingKey(pk groth16.ProvingKey, pkPath string) {
+	dumpPath := pkPath + ".dump"
+	if fi, err := os.Stat(dumpPath); err == nil && fi.Size() > 0 {
+		dr, ok := pk.(dumpReadable)
+		if !ok {
+			die("proving key type %T does not support ReadDump", pk)
+		}
+		f, err := os.Open(dumpPath)
+		if err != nil {
+			die("open pk dump %s: %v", dumpPath, err)
+		}
+		defer f.Close()
+		t := time.Now()
+		if err := dr.ReadDump(bufio.NewReaderSize(f, 1<<22)); err != nil {
+			die("ReadDump %s: %v", dumpPath, err)
+		}
+		fmt.Fprintf(os.Stderr, "pk loaded (dump, no decompression) in %s\n", time.Since(t).Round(time.Millisecond))
+		return
+	}
+	t := time.Now()
+	readFrom(pkPath, pk)
+	fmt.Fprintf(os.Stderr, "pk loaded (compressed ReadFrom) in %s\n", time.Since(t).Round(time.Millisecond))
+}
+
+func writeDump(path string, dw dumpWritable) {
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		die("create %s: %v", tmp, err)
+	}
+	bw := bufio.NewWriterSize(f, 1<<22)
+	t := time.Now()
+	fail := func(format string, a ...any) {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		die(format, a...)
+	}
+	if err := dw.WriteDump(bw); err != nil {
+		fail("WriteDump %s: %v", tmp, err)
+	}
+	if err := bw.Flush(); err != nil {
+		fail("flush %s: %v", tmp, err)
+	}
+	if err := f.Sync(); err != nil {
+		fail("sync %s: %v", tmp, err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		die("close %s: %v", tmp, err)
+	}
+	// Publish atomically: a crashed dump leaves only <path>.tmp, which loadProvingKey ignores.
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		die("rename %s -> %s: %v", tmp, path, err)
+	}
+	fmt.Fprintf(os.Stderr, "WriteDump %s in %s\n", path, time.Since(t).Round(time.Second))
+}
+
+func sha256File(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		die("open %s: %v", path, err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, bufio.NewReaderSize(f, 1<<22)); err != nil {
+		die("hash %s: %v", path, err)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// cmdDump converts the compressed pk.bin into a raw `pk.bin.dump` (gnark WriteDump) that prove
+// loads via ReadDump without per-point decompression. Run ONCE (e.g. at image build); the slow
+// ReadFrom is paid here, not on every prove. With --check it additionally round-trips the dump
+// (ReadDump -> re-WriteDump) and asserts byte-identity, validating that the dump faithfully
+// restores the real ceremony key (no dev keys, no vk, no prove needed).
+func cmdDump(args []string) {
+	fs := flag.NewFlagSet("dump", flag.ExitOnError)
+	keysDirFlag := fs.String("keys", "", "explicit keys dir containing pk.bin")
+	keySet := fs.String("key", "", "manifest key-set (when --keys is not given)")
+	check := fs.Bool("check", false, "round-trip the dump and assert byte-identity")
+	_ = fs.Parse(args)
+
+	var pkPath string
+	if *keysDirFlag != "" {
+		pkPath = filepath.Join(*keysDirFlag, pkFile)
+	} else {
+		man, err := keys.Load()
+		if err != nil {
+			die("%v", err)
+		}
+		ks, err := man.Resolve(*keySet)
+		if err != nil {
+			die("%v", err)
+		}
+		cache, err := ks.CacheDir("")
+		if err != nil {
+			die("%v", err)
+		}
+		logf := func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) }
+		if pkPath, err = ks.EnsurePK(cache, logf); err != nil {
+			die("%v", err)
+		}
+	}
+
+	pk := newProvingKey()
+	t := time.Now()
+	readFrom(pkPath, pk)
+	fmt.Fprintf(os.Stderr, "pk ReadFrom (compressed) in %s\n", time.Since(t).Round(time.Second))
+
+	dw, ok := pk.(dumpWritable)
+	if !ok {
+		die("proving key type %T does not support WriteDump", pk)
+	}
+	dumpPath := pkPath + ".dump"
+	writeDump(dumpPath, dw)
+	fmt.Printf("wrote %s\n", dumpPath)
+
+	if *check {
+		pk2 := newProvingKey()
+		dr, ok := pk2.(dumpReadable)
+		if !ok {
+			die("proving key type %T does not support ReadDump", pk2)
+		}
+		f, err := os.Open(dumpPath)
+		if err != nil {
+			die("open %s: %v", dumpPath, err)
+		}
+		t = time.Now()
+		if err := dr.ReadDump(bufio.NewReaderSize(f, 1<<22)); err != nil {
+			die("ReadDump (check): %v", err)
+		}
+		_ = f.Close()
+		fmt.Fprintf(os.Stderr, "ReadDump (check) in %s\n", time.Since(t).Round(time.Millisecond))
+		dw2, ok := pk2.(dumpWritable)
+		if !ok {
+			die("reloaded key type %T does not support WriteDump", pk2)
+		}
+		checkPath := dumpPath + ".check"
+		writeDump(checkPath, dw2)
+		a := sha256File(dumpPath)
+		b := sha256File(checkPath)
+		_ = os.Remove(checkPath)
+		if a != b {
+			die("ROUND-TRIP MISMATCH: dump %s != re-dump %s", a, b)
+		}
+		fmt.Printf("round-trip OK: dump sha256 %s stable across ReadDump->WriteDump\n", a)
 	}
 }
 
