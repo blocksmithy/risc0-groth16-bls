@@ -32,6 +32,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -402,39 +404,90 @@ func readFrom(path string, v io.ReaderFrom) {
 type dumpReadable interface{ ReadDump(io.Reader) error }
 type dumpWritable interface{ WriteDump(io.Writer) error }
 
-// loadProvingKey loads pk from a raw `<pkPath>.dump` (WriteDump format) when present, else the
-// compressed pkPath via ReadFrom. Generate the dump once with `groth16bls dump` so prove never
-// pays the decompression cost.
+// dumpFormatTag is the first token of a dump header; bump it to invalidate older dumps wholesale.
+const dumpFormatTag = "risc0-groth16bls-dump1"
+
+// gnarkVersion reports the gnark module version this binary was built against. A raw dump made by a
+// different gnark may have a different in-memory layout, so it is part of the dump's identity.
+func gnarkVersion() string {
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		for _, d := range bi.Deps {
+			if d.Path == "github.com/consensys/gnark" {
+				return d.Version
+			}
+		}
+	}
+	return "unknown"
+}
+
+// dumpHeader is the one-line, self-describing header written at the front of a `<pk>.dump`. gnark's raw
+// dump is build-, arch-, and version-specific and skips every check, so the header pins the dump to the
+// exact binary and pk that produced it. A CPU-built dump fed to the GPU prover (or vice versa) carries
+// a different backend here and is rejected, instead of being mis-read into a crash.
+func dumpHeader(pkPath string) string {
+	var size int64 = -1
+	if fi, err := os.Stat(pkPath); err == nil {
+		size = fi.Size()
+	}
+	return fmt.Sprintf("%s backend=%s goarch=%s gnark=%s pksize=%d\n",
+		dumpFormatTag, proverBackend, runtime.GOARCH, gnarkVersion(), size)
+}
+
+// openMatchingDump opens dumpPath and checks its header against the running binary. On a match it
+// returns a reader positioned at the raw dump (ready for ReadDump) plus the open file for the caller to
+// close. On any mismatch - different build/arch/gnark, a changed pk, an old headerless dump, or an
+// unreadable file - it logs the reason, closes the file, and returns ok=false so the caller falls back
+// to the safe compressed ReadFrom.
+func openMatchingDump(dumpPath, pkPath string) (io.Reader, *os.File, bool) {
+	f, err := os.Open(dumpPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pk dump %s: %v; using ReadFrom\n", dumpPath, err)
+		return nil, nil, false
+	}
+	br := bufio.NewReaderSize(f, 1<<22)
+	got, err := br.ReadString('\n')
+	want := dumpHeader(pkPath)
+	if err != nil || got != want {
+		fmt.Fprintf(os.Stderr, "ignoring pk dump (header mismatch): got %q want %q; using ReadFrom\n",
+			strings.TrimSpace(got), strings.TrimSpace(want))
+		_ = f.Close()
+		return nil, nil, false
+	}
+	return br, f, true
+}
+
+// loadProvingKey loads pk from a raw `<pkPath>.dump` (WriteDump format) when one is present whose
+// header matches this binary, else the compressed pkPath via ReadFrom. Generate the dump once with
+// `groth16bls dump` so prove never pays the decompression cost.
 //
-// The dump is gnark-version- and arch-specific and skips subgroup checks (raw, trusted load). It is
-// auto-used whenever `<pkPath>.dump` exists, so regenerate it whenever the binary's gnark version
-// changes and never carry a stale dump across an upgrade. A wrong dump is not silently mis-proven:
-// the post-prove self-verify in cmdProve fails closed.
+// The raw dump is build-, arch-, and gnark-version-specific and skips subgroup checks; a dump produced
+// by a different build (e.g. the CPU binary feeding the GPU prover) is NOT interchangeable and would be
+// mis-read into a crash. Each dump carries a header (see dumpHeader); loadProvingKey uses it only on an
+// exact match via openMatchingDump and otherwise falls back to ReadFrom, so a mismatched or stale dump
+// is ignored rather than trusted.
 func loadProvingKey(pk groth16.ProvingKey, pkPath string) {
 	dumpPath := pkPath + ".dump"
 	if fi, err := os.Stat(dumpPath); err == nil && fi.Size() > 0 {
-		dr, ok := pk.(dumpReadable)
-		if !ok {
-			die("proving key type %T does not support ReadDump", pk)
+		if r, f, ok := openMatchingDump(dumpPath, pkPath); ok {
+			defer f.Close()
+			dr, ok := pk.(dumpReadable)
+			if !ok {
+				die("proving key type %T does not support ReadDump", pk)
+			}
+			t := time.Now()
+			if err := dr.ReadDump(r); err != nil {
+				die("ReadDump %s: %v", dumpPath, err)
+			}
+			fmt.Fprintf(os.Stderr, "pk loaded (dump, no decompression) in %s\n", time.Since(t).Round(time.Millisecond))
+			return
 		}
-		f, err := os.Open(dumpPath)
-		if err != nil {
-			die("open pk dump %s: %v", dumpPath, err)
-		}
-		defer f.Close()
-		t := time.Now()
-		if err := dr.ReadDump(bufio.NewReaderSize(f, 1<<22)); err != nil {
-			die("ReadDump %s: %v", dumpPath, err)
-		}
-		fmt.Fprintf(os.Stderr, "pk loaded (dump, no decompression) in %s\n", time.Since(t).Round(time.Millisecond))
-		return
 	}
 	t := time.Now()
 	readFrom(pkPath, pk)
 	fmt.Fprintf(os.Stderr, "pk loaded (compressed ReadFrom) in %s\n", time.Since(t).Round(time.Millisecond))
 }
 
-func writeDump(path string, dw dumpWritable) {
+func writeDump(path, header string, dw dumpWritable) {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
@@ -446,6 +499,9 @@ func writeDump(path string, dw dumpWritable) {
 		_ = f.Close()
 		_ = os.Remove(tmp)
 		die(format, a...)
+	}
+	if _, err := bw.WriteString(header); err != nil {
+		fail("write dump header %s: %v", tmp, err)
 	}
 	if err := dw.WriteDump(bw); err != nil {
 		fail("WriteDump %s: %v", tmp, err)
@@ -525,7 +581,8 @@ func cmdDump(args []string) {
 		die("proving key type %T does not support WriteDump", pk)
 	}
 	dumpPath := pkPath + ".dump"
-	writeDump(dumpPath, dw)
+	header := dumpHeader(pkPath)
+	writeDump(dumpPath, header, dw)
 	fmt.Printf("wrote %s\n", dumpPath)
 
 	if *check {
@@ -534,12 +591,12 @@ func cmdDump(args []string) {
 		if !ok {
 			die("proving key type %T does not support ReadDump", pk2)
 		}
-		f, err := os.Open(dumpPath)
-		if err != nil {
-			die("open %s: %v", dumpPath, err)
+		r, f, ok := openMatchingDump(dumpPath, pkPath)
+		if !ok {
+			die("dump header check failed for %s", dumpPath)
 		}
 		t = time.Now()
-		if err := dr.ReadDump(bufio.NewReaderSize(f, 1<<22)); err != nil {
+		if err := dr.ReadDump(r); err != nil {
 			die("ReadDump (check): %v", err)
 		}
 		_ = f.Close()
@@ -549,7 +606,7 @@ func cmdDump(args []string) {
 			die("reloaded key type %T does not support WriteDump", pk2)
 		}
 		checkPath := dumpPath + ".check"
-		writeDump(checkPath, dw2)
+		writeDump(checkPath, header, dw2)
 		a := sha256File(dumpPath)
 		b := sha256File(checkPath)
 		_ = os.Remove(checkPath)
